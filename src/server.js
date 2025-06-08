@@ -43,9 +43,20 @@ app.post('/api/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     
-    // Use environment variables or fallback to defaults
+    // Use environment variables only
     const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
     const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+    
+    // Check if environment variables are set
+    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
+      console.error('Admin credentials not configured in environment variables');
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Server configuration error - admin credentials not set' 
+      });
+    }
+    
+    console.log('Login attempt:', { username, hasEnvVars: !!ADMIN_USERNAME });
     
     if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
       res.json({ 
@@ -330,7 +341,6 @@ const startServer = async () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📱 Mobile API: http://localhost:${PORT}/api/mobile`);
       console.log(`🖥️  Admin API: http://localhost:${PORT}/api`);
-      console.log(`🔑 Admin Login: admin / admin123`);
     });
     
   } catch (error) {
