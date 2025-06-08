@@ -43,12 +43,15 @@ app.post('/api/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     
-    // Simple hardcoded admin for MVP (you can change this)
-    if (username === 'admin' && password === 'admin123') {
+    // Use environment variables or fallback to defaults
+    const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+    
+    if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
       res.json({ 
         success: true, 
         message: 'Login successful',
-        admin: { username: 'admin' }
+        admin: { username: ADMIN_USERNAME }
       });
     } else {
       res.status(401).json({ 
