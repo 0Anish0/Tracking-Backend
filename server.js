@@ -26,7 +26,7 @@ app.use(express.json());
 // MongoDB Connection
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/logistics_tracker');
+    await mongoose.connect(process.env.MONGODB_URI);
     console.log('📦 MongoDB connected successfully');
   } catch (error) {
     console.error('❌ MongoDB connection error:', error);
