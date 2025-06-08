@@ -2,14 +2,22 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const mongoose = require('mongoose');
 const dotenv = require('dotenv');
+const connectDB = require('./src/config/database');
+
+// Import models
+const Driver = require('./src/models/Driver');
+const Location = require('./src/models/Location');
+const Admin = require('./src/models/Admin');
 
 // Load environment variables
 dotenv.config();
 
+// Create Express app
 const app = express();
 const server = http.createServer(app);
+
+// Initialize Socket.IO
 const io = socketIo(server, {
   cors: {
     origin: "*",
@@ -17,312 +25,328 @@ const io = socketIo(server, {
   }
 });
 
-const PORT = process.env.PORT || 3001;
-
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection
-const connectDB = async () => {
+// In-memory storage for drivers when DB is not available
+let drivers = new Map();
+let locations = [];
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Admin login endpoint
+app.post('/api/admin/login', async (req, res) => {
   try {
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log('📦 MongoDB connected successfully');
+    const { username, password } = req.body;
+    
+    // Use environment variables only
+    const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+    
+    // Check if environment variables are set
+    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
+      console.error('Admin credentials not configured in environment variables');
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Server configuration error - admin credentials not set' 
+      });
+    }
+    
+    console.log('Login attempt:', { username, hasEnvVars: !!ADMIN_USERNAME });
+    
+    if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+      res.json({ 
+        success: true, 
+        message: 'Login successful',
+        admin: { username: ADMIN_USERNAME }
+      });
+    } else {
+      res.status(401).json({ 
+        success: false, 
+        message: 'Invalid credentials' 
+      });
+    }
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error);
-    process.exit(1);
-  }
-};
-
-// Location Schema
-const locationSchema = new mongoose.Schema({
-  deviceId: {
-    type: String,
-    required: true,
-    index: true
-  },
-  driverName: {
-    type: String,
-    default: 'Unknown Driver'
-  },
-  latitude: {
-    type: Number,
-    required: true
-  },
-  longitude: {
-    type: Number,
-    required: true
-  },
-  accuracy: {
-    type: Number,
-    default: 0
-  },
-  timestamp: {
-    type: Date,
-    default: Date.now,
-    index: true
-  },
-  speed: {
-    type: Number,
-    default: 0
-  },
-  heading: {
-    type: Number,
-    default: 0
-  },
-  isOnline: {
-    type: Boolean,
-    default: true
+    console.error('Login error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error' 
+    });
   }
 });
 
-const Location = mongoose.model('Location', locationSchema);
-
-// Driver Schema
-const driverSchema = new mongoose.Schema({
-  deviceId: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  driverName: {
-    type: String,
-    required: true
-  },
-  isActive: {
-    type: Boolean,
-    default: true
-  },
-  lastSeen: {
-    type: Date,
-    default: Date.now
-  },
-  currentLocation: {
-    latitude: Number,
-    longitude: Number,
-    timestamp: Date
-  }
-});
-
-const Driver = mongoose.model('Driver', driverSchema);
-
-// Store active connections
-const activeConnections = new Map();
-
-// Connect to MongoDB
-connectDB();
-
-// Basic routes
-app.get('/', (req, res) => {
-  res.json({
-    message: 'Logistics Location Tracker Backend',
-    status: 'running',
-    activeDrivers: activeConnections.size
-  });
-});
-
-// Get all active drivers
+// Get all drivers
 app.get('/api/drivers', async (req, res) => {
   try {
-    const drivers = await Driver.find({ isActive: true }).sort({ lastSeen: -1 });
-    res.json(drivers);
+    if (process.env.MONGODB_URI) {
+      const dbDrivers = await Driver.find({}).sort({ lastSeen: -1 });
+      res.json({ success: true, drivers: dbDrivers });
+    } else {
+      const driverList = Array.from(drivers.values());
+      res.json({ success: true, drivers: driverList });
+    }
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error fetching drivers:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// Get driver's location history
+// Get driver locations
 app.get('/api/locations/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { hours = 24 } = req.query;
     
-    const startTime = new Date(Date.now() - hours * 60 * 60 * 1000);
-    const locations = await Location.find({
-      deviceId,
-      timestamp: { $gte: startTime }
-    }).sort({ timestamp: -1 });
-    
-    res.json(locations);
+    if (process.env.MONGODB_URI) {
+      const dbLocations = await Location.find({ deviceId })
+        .sort({ timestamp: -1 })
+        .limit(100);
+      res.json({ success: true, locations: dbLocations });
+    } else {
+      const driverLocations = locations.filter(loc => loc.deviceId === deviceId);
+      res.json({ success: true, locations: driverLocations });
+    }
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error fetching locations:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// Socket.IO connection handling
+// Get all recent locations
+app.get('/api/locations', async (req, res) => {
+  try {
+    if (process.env.MONGODB_URI) {
+      // Get latest location for each driver from database
+      const dbLocations = await Location.aggregate([
+        {
+          $sort: { deviceId: 1, timestamp: -1 }
+        },
+        {
+          $group: {
+            _id: '$deviceId',
+            latestLocation: { $first: '$$ROOT' }
+          }
+        },
+        {
+          $replaceRoot: { newRoot: '$latestLocation' }
+        }
+      ]);
+      res.json({ success: true, locations: dbLocations });
+    } else {
+      // Get last location for each driver from memory
+      const recentLocations = [];
+      drivers.forEach((driver, deviceId) => {
+        const driverLocations = locations.filter(loc => loc.deviceId === deviceId);
+        if (driverLocations.length > 0) {
+          recentLocations.push(driverLocations[driverLocations.length - 1]);
+        }
+      });
+      res.json({ success: true, locations: recentLocations });
+    }
+  } catch (error) {
+    console.error('Error fetching locations:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Mobile API status
+app.get('/api/mobile/status', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Mobile API is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Socket connection handling
 io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
+  console.log('Client connected:', socket.id);
 
   // Handle driver registration
-  socket.on('registerDriver', async (driverData) => {
+  socket.on('register-driver', async (data) => {
+    const { deviceId, driverName } = data;
+    
+    const driverData = {
+      deviceId,
+      driverName,
+      isOnline: true,
+      lastSeen: new Date().toISOString(),
+      socketId: socket.id
+    };
+    
     try {
-      const { deviceId, driverName } = driverData;
+      if (process.env.MONGODB_URI) {
+        // Save to database
+        await Driver.findOneAndUpdate(
+          { deviceId },
+          { 
+            driverName,
+            isOnline: true,
+            lastSeen: new Date()
+          },
+          { upsert: true, new: true }
+        );
+      }
       
-      // Update or create driver record
-      await Driver.findOneAndUpdate(
-        { deviceId },
-        { 
-          driverName,
-          isActive: true,
-          lastSeen: new Date()
-        },
-        { upsert: true, new: true }
-      );
-
-      // Store connection info
-      activeConnections.set(socket.id, { deviceId, driverName });
+      // Also keep in memory for real-time updates
+      drivers.set(deviceId, driverData);
+      socket.deviceId = deviceId;
       
       console.log(`Driver registered: ${driverName} (${deviceId})`);
       
-      // Send active drivers to admin panels
-      const activeDrivers = await Driver.find({ isActive: true });
-      io.emit('driversUpdate', activeDrivers);
-      
+      // Broadcast driver list update to all clients
+      io.emit('drivers-updated', Array.from(drivers.values()));
     } catch (error) {
-      console.error('Driver registration error:', error);
-      socket.emit('error', 'Failed to register driver');
+      console.error('Error registering driver:', error);
     }
   });
 
-  // Handle location updates from mobile app
-  socket.on('sendLocation', async (locationData) => {
+  // Handle location updates
+  socket.on('location-update', async (locationData) => {
+    const { deviceId } = locationData;
+    
+    // Create location object
+    const location = {
+      ...locationData,
+      timestamp: new Date().toISOString(),
+      isOnline: true
+    };
+    
     try {
-      const connectionInfo = activeConnections.get(socket.id);
-      if (!connectionInfo) {
-        socket.emit('error', 'Driver not registered');
-        return;
-      }
-
-      const { deviceId } = connectionInfo;
-      
-      // Save location to database
-      const location = new Location({
-        ...locationData,
-        deviceId,
-        timestamp: new Date(locationData.timestamp),
-        isOnline: true
-      });
-      
-      await location.save();
-
-      // Update driver's current location and last seen
-      await Driver.findOneAndUpdate(
-        { deviceId },
-        {
-          currentLocation: {
-            latitude: locationData.latitude,
-            longitude: locationData.longitude,
-            timestamp: new Date()
-          },
-          lastSeen: new Date()
-        }
-      );
-
-      console.log(`Location saved for driver ${deviceId}:`, locationData);
-
-      // Broadcast location to all connected admin panels
-      io.emit('locationUpdate', {
-        ...locationData,
-        deviceId,
-        driverName: connectionInfo.driverName,
-        socketId: socket.id
-      });
-
-    } catch (error) {
-      console.error('Location save error:', error);
-      socket.emit('error', 'Failed to save location');
-    }
-  });
-
-  // Handle bulk location sync (for offline data)
-  socket.on('syncLocations', async (locationsArray) => {
-    try {
-      const connectionInfo = activeConnections.get(socket.id);
-      if (!connectionInfo) {
-        socket.emit('error', 'Driver not registered');
-        return;
-      }
-
-      const { deviceId } = connectionInfo;
-      
-      // Process bulk locations
-      const locationDocs = locationsArray.map(loc => ({
-        ...loc,
-        deviceId,
-        timestamp: new Date(loc.timestamp),
-        isOnline: false // Mark as synced offline data
-      }));
-
-      await Location.insertMany(locationDocs);
-      
-      console.log(`Synced ${locationsArray.length} offline locations for driver ${deviceId}`);
-      
-      // Send confirmation
-      socket.emit('syncComplete', { 
-        count: locationsArray.length,
-        message: 'Locations synced successfully'
-      });
-
-      // Update admin panels with latest location
-      if (locationsArray.length > 0) {
-        const latestLocation = locationsArray[locationsArray.length - 1];
-        io.emit('locationUpdate', {
-          ...latestLocation,
-          deviceId,
-          driverName: connectionInfo.driverName,
-          socketId: socket.id
+      if (process.env.MONGODB_URI) {
+        // Save to database
+        const newLocation = new Location({
+          deviceId: location.deviceId,
+          driverName: location.driverName,
+          latitude: location.latitude,
+          longitude: location.longitude,
+          accuracy: location.accuracy,
+          speed: location.speed,
+          heading: location.heading,
+          timestamp: new Date(location.timestamp),
+          isOnline: location.isOnline
         });
+        await newLocation.save();
+        
+        // Update driver's last seen
+        await Driver.findOneAndUpdate(
+          { deviceId },
+          { 
+            lastSeen: new Date(),
+            isOnline: true
+          }
+        );
       }
-
+      
+      // Store in memory for real-time updates
+      locations.push(location);
+      
+      // Keep only last 100 locations per driver in memory
+      const deviceLocations = locations.filter(loc => loc.deviceId === deviceId);
+      if (deviceLocations.length > 100) {
+        const firstOldLocationIndex = locations.findIndex(loc => loc.deviceId === deviceId);
+        locations.splice(firstOldLocationIndex, 1);
+      }
+      
+      // Update driver info in memory
+      if (drivers.has(deviceId)) {
+        const driver = drivers.get(deviceId);
+        driver.lastSeen = new Date().toISOString();
+        driver.isOnline = true;
+        drivers.set(deviceId, driver);
+      }
+      
+      console.log(`Location update from ${deviceId}: ${locationData.latitude}, ${locationData.longitude}`);
+      
+      // Broadcast location to all admin clients
+      io.emit('location-update', location);
     } catch (error) {
-      console.error('Bulk location sync error:', error);
-      socket.emit('syncError', 'Failed to sync offline locations');
+      console.error('Error saving location:', error);
     }
   });
 
   // Handle disconnection
   socket.on('disconnect', async () => {
-    const connectionInfo = activeConnections.get(socket.id);
-    if (connectionInfo) {
-      console.log(`Driver disconnected: ${connectionInfo.driverName} (${connectionInfo.deviceId})`);
-      
-      // Update driver status but don't set inactive immediately
-      // (they might reconnect soon)
+    console.log('Client disconnected:', socket.id);
+    
+    if (socket.deviceId) {
       try {
-        await Driver.findOneAndUpdate(
-          { deviceId: connectionInfo.deviceId },
-          { lastSeen: new Date() }
-        );
+        if (process.env.MONGODB_URI) {
+          // Update database
+          await Driver.findOneAndUpdate(
+            { deviceId: socket.deviceId },
+            { 
+              isOnline: false,
+              lastSeen: new Date()
+            }
+          );
+        }
+        
+        // Update memory
+        if (drivers.has(socket.deviceId)) {
+          const driver = drivers.get(socket.deviceId);
+          driver.isOnline = false;
+          driver.lastSeen = new Date().toISOString();
+          drivers.set(socket.deviceId, driver);
+          
+          // Broadcast driver status update
+          io.emit('drivers-updated', Array.from(drivers.values()));
+        }
       } catch (error) {
-        console.error('Error updating driver on disconnect:', error);
+        console.error('Error updating driver status:', error);
       }
-      
-      activeConnections.delete(socket.id);
     }
-  });
-
-  // Handle errors
-  socket.on('error', (error) => {
-    console.error('Socket error:', error);
   });
 });
 
-// Cleanup inactive drivers periodically (every 5 minutes)
-setInterval(async () => {
-  try {
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-    await Driver.updateMany(
-      { lastSeen: { $lt: fiveMinutesAgo } },
-      { isActive: false }
-    );
-  } catch (error) {
-    console.error('Error cleaning up inactive drivers:', error);
-  }
-}, 5 * 60 * 1000);
+// Error handling
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({
+    success: false,
+    message: 'Internal Server Error'
+  });
+});
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 Logistics location tracking backend ready`);
-  console.log(`🚛 Multiple driver support enabled`);
-  console.log(`💾 MongoDB integration active`);
-}); 
+// Start server
+const PORT = process.env.PORT || 3001;
+
+const startServer = async () => {
+  try {
+    // Connect to database (optional for MVP)
+    if (process.env.MONGODB_URI) {
+      await connectDB();
+      console.log('📁 Database connected');
+      
+      // Load existing drivers from database to memory for real-time updates
+      const dbDrivers = await Driver.find({ isOnline: true });
+      dbDrivers.forEach(driver => {
+        drivers.set(driver.deviceId, {
+          deviceId: driver.deviceId,
+          driverName: driver.driverName,
+          isOnline: driver.isOnline,
+          lastSeen: driver.lastSeen.toISOString(),
+          socketId: null
+        });
+      });
+      console.log(`📊 Loaded ${dbDrivers.length} drivers from database`);
+    } else {
+      console.log('📁 Using in-memory storage (no database configured)');
+    }
+    
+    server.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`📱 Mobile API: http://localhost:${PORT}/api/mobile`);
+      console.log(`🖥️  Admin API: http://localhost:${PORT}/api`);
+    });
+    
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+startServer(); 
